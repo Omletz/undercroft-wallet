@@ -1,0 +1,10 @@
+# Undercroft Wallet GUI dependencies.
+# The Stage 4 indexer files (db.py, queries.py, cards.py, node_client.py)
+# have no extra dependencies beyond the standard library -- only the GUI
+# layer itself needs a new package.
+PySide6>=6.5
+
+# Verifies the Ed25519 signature on the card-set manifest before trusting
+# it (set_manifest.py) -- also needed to run sign_manifest.py and
+# keygen_manifest_signing.py, which sign it in the first place.
+cryptography>=41

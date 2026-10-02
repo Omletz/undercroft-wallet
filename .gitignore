@@ -1,0 +1,6 @@
+bin/
+build/
+dist/
+pow_tcg.sqlite3
+__pycache__/
+*.pyc
