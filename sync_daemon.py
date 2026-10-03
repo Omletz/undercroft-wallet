@@ -142,7 +142,23 @@ def run_once(conn, node: NodeClient, scheme: SaltedFutureBlockReveal) -> dict:
     last_synced = db.get_last_synced_height(conn)
 
     reorg_handled = False
-    if last_synced > 0:
+    if last_synced > tip:
+        # The node's chain is now shorter than what we'd already synced --
+        # e.g. a deliberate genesis wipe/rewind, or a very deep reorg. Every
+        # height above the new tip is gone for certain (the node provably
+        # doesn't have a block there), so there's no point asking for it.
+        # Only the new tip itself (if above genesis) needs a hash check to
+        # tell a clean truncation apart from a reorg that also changed
+        # history at or below the old tip.
+        if tip > 0 and db.get_active_block_hash_at_height(conn, tip) == node.get_block_hash(tip):
+            fork_height = tip + 1
+        else:
+            fork_height = find_fork_point(conn, node, tip) if tip > 0 else 1
+        handle_reorg(conn, node, fork_height, last_synced, tip)
+        db.set_last_synced_height(conn, fork_height - 1)
+        last_synced = fork_height - 1
+        reorg_handled = True
+    elif last_synced > 0:
         db_hash = db.get_active_block_hash_at_height(conn, last_synced)
         node_hash = node.get_block_hash(last_synced)
         if db_hash != node_hash:
