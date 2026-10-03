@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command setup for the Undercroft Wallet. Run this once:
 #   bash setup_wallet.sh
-# It installs the one missing dependency, finds your compiled bitcoind on
+# It installs any missing dependencies, finds your compiled bitcoind on
 # its own (falls back to asking ONCE if it truly can't find it), and then
 # launches the wallet. No manual pip commands, no editing a settings
 # screen, no hunting through folders yourself.
@@ -10,10 +10,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "[1/3] Checking for PySide6..."
+echo "[1/3] Checking for dependencies..."
 if ! python3 -c "import PySide6" 2>/dev/null; then
-    echo "      Installing it (one-time, ~1 minute)..."
+    echo "      Installing PySide6 (one-time, ~1 minute)..."
     pip3 install PySide6 --break-system-packages --quiet
+fi
+if ! python3 -c "import cryptography" 2>/dev/null; then
+    echo "      Installing cryptography (one-time, ~10 seconds)..."
+    pip3 install cryptography --break-system-packages --quiet
 fi
 
 mkdir -p bin
