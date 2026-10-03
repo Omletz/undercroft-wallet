@@ -28,7 +28,7 @@ from typing import Optional
 
 import db
 import set_registry
-from node_client import NodeClient
+from node_client import AmbiguousPayoutError, NodeClient
 from reveal import SaltedFutureBlockReveal, classify_seed, pick_card_index
 
 log = logging.getLogger("sync_daemon")
@@ -86,7 +86,22 @@ def handle_reorg(conn, node: NodeClient, fork_height: int, old_tip: int, new_tip
 def sync_forward(conn, node: NodeClient, scheme: SaltedFutureBlockReveal, from_height: int, tip: int) -> None:
     for height in range(from_height, tip + 1):
         block_hash = node.get_block_hash(height)
-        payout_script = node.get_block_payout_script(height)
+        try:
+            payout_script = node.get_block_payout_script(height)
+        except AmbiguousPayoutError:
+            # Structural, not transient -- this block's coinbase will never
+            # resolve to exactly one miner payout address no matter how many
+            # times we ask. Index it as a clean (no-card) block: recorded for
+            # reorg tracking, no pending pack, and move on -- never halt the
+            # whole sync pass or spin retrying the same height forever.
+            log.warning(
+                "height %d: ambiguous/unresolvable coinbase payout -- indexing "
+                "as a clean block (no card possible), see exception for detail",
+                height, exc_info=True,
+            )
+            db.insert_block(conn, block_hash, height, None)
+            db.set_last_synced_height(conn, height)
+            continue
         db.insert_block(conn, block_hash, height, payout_script)
         db.insert_pending_pack(
             conn,

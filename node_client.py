@@ -55,6 +55,19 @@ class NodeRPCError(RuntimeError):
     (e.g. bad height, node still warming up / not fully synced)."""
 
 
+class AmbiguousPayoutError(NodeRPCError):
+    """A block's coinbase did not resolve to exactly one miner payout address --
+    zero candidates (e.g. the sole non-fee output had no resolvable address),
+    or two or more (e.g. dev_fee_address misconfigured/stale relative to this
+    coin's actual pool setup). This is a STRUCTURAL property of the block's
+    coinbase, never a transient RPC problem (those stay plain NodeRPCError /
+    NodeConnectionError / NodeAuthError). Callers must not retry this -- the
+    block's coinbase shape is permanent, so retrying gets the same answer
+    forever. Correct handling: treat the block as a clean, no-card block
+    (coins only -- this block can never mint a pack), log it for operator
+    visibility, and keep indexing forward."""
+
+
 @dataclass
 class NodeConfig:
     """Everything needed to reach one Core-compatible daemon's RPC interface.
@@ -202,14 +215,17 @@ class BitcoinRPCClient:
             if script_pub_key.get("type") == "nulldata":
                 continue  # OP_RETURN witness commitment -- never a payout
             addr = self._vout_address(script_pub_key)
+            if addr is None:
+                continue  # unresolvable script -- can't count as a miner payout candidate
             if self.config.dev_fee_address and addr == self.config.dev_fee_address:
                 continue  # this pool's dev fee output, not the miner
             candidates.append(addr)
 
         if len(candidates) != 1:
-            raise NodeRPCError(
-                f"Expected exactly one non-dev-fee, non-witness-commitment coinbase "
-                f"output at height {height}, found {len(candidates)}: {candidates}. "
-                f"Check dev_fee_address config against this coin's actual pool setup."
+            raise AmbiguousPayoutError(
+                f"Expected exactly one non-dev-fee, non-witness-commitment, resolvable "
+                f"coinbase output at height {height}, found {len(candidates)}: {candidates}. "
+                f"Check dev_fee_address config against this coin's actual pool setup. "
+                f"This block will be indexed as a clean (no-card) block."
             )
         return candidates[0]

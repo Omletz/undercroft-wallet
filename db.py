@@ -44,7 +44,12 @@ CREATE TABLE IF NOT EXISTS card_catalog (
 CREATE TABLE IF NOT EXISTS blocks (
     block_hash     TEXT PRIMARY KEY,
     height         INTEGER NOT NULL,
-    payout_script  TEXT NOT NULL,
+    payout_script  TEXT,            -- NULL means this block's coinbase was
+                                     -- ambiguous/unresolvable (see
+                                     -- node_client.AmbiguousPayoutError) --
+                                     -- indexed for reorg tracking, but it
+                                     -- never gets a pending pack row, so it
+                                     -- can never mint a card.
     is_active      INTEGER NOT NULL DEFAULT 1,
     first_seen_at  TEXT NOT NULL,
     deactivated_at TEXT
@@ -173,7 +178,10 @@ def get_active_block_hash_at_height(conn: sqlite3.Connection, height: int) -> Op
     return row["block_hash"] if row else None
 
 
-def insert_block(conn: sqlite3.Connection, block_hash: str, height: int, payout_script: str) -> None:
+def insert_block(conn: sqlite3.Connection, block_hash: str, height: int, payout_script: Optional[str]) -> None:
+    """payout_script is None for a block whose coinbase was ambiguous/unresolvable
+    (AmbiguousPayoutError at sync time) -- stored for reorg tracking only; no
+    pending pack is ever created for it, so it never becomes a card candidate."""
     conn.execute(
         """INSERT INTO blocks (block_hash, height, payout_script, is_active, first_seen_at)
            VALUES (?, ?, ?, 1, ?)""",
