@@ -105,15 +105,37 @@ GROUP BY b.payout_script;
 """
 
 
+# PRAGMA user_version. v1.0.0 files are 0; 2 means the one-time recheck of
+# cards revealed inside a past reorg's maturity window has run (see
+# sync_daemon.recheck_reorg_window_reveals).
+SCHEMA_VERSION = 2
+
+# How long a connection waits on another connection's lock before raising
+# "database is locked". Python's own default is 5s.
+BUSY_TIMEOUT_S = 30
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL: the Binder tab's read-only reads and the indexer's writes no longer
+    # block each other. Persistent on the file, harmless to re-issue, and a
+    # no-op for :memory: test databases.
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
+
+
+def get_schema_version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def set_schema_version(conn: sqlite3.Connection, version: int) -> None:
+    conn.execute(f"PRAGMA user_version = {int(version)}")
 
 
 @contextmanager
@@ -148,9 +170,22 @@ def seed_card_catalog(conn: sqlite3.Connection) -> None:
     for tier, pool in cards.CARD_SETS.items():
         for index, card in enumerate(pool):
             rows.append((card.card_id, cards.SET_ID, tier, index, card.name, card.description))
+    # Upsert that only writes when something actually changed, so the
+    # every-pass reseed doesn't rewrite the whole catalog each refresh tick.
     conn.executemany(
-        """INSERT OR REPLACE INTO card_catalog (card_id, set_id, tier, pool_index, name, description)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO card_catalog (card_id, set_id, tier, pool_index, name, description)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(card_id) DO UPDATE SET
+               set_id = excluded.set_id,
+               tier = excluded.tier,
+               pool_index = excluded.pool_index,
+               name = excluded.name,
+               description = excluded.description
+           WHERE card_catalog.set_id IS NOT excluded.set_id
+              OR card_catalog.tier IS NOT excluded.tier
+              OR card_catalog.pool_index IS NOT excluded.pool_index
+              OR card_catalog.name IS NOT excluded.name
+              OR card_catalog.description IS NOT excluded.description""",
         rows,
     )
 
@@ -181,10 +216,20 @@ def get_active_block_hash_at_height(conn: sqlite3.Connection, height: int) -> Op
 def insert_block(conn: sqlite3.Connection, block_hash: str, height: int, payout_script: Optional[str]) -> None:
     """payout_script is None for a block whose coinbase was ambiguous/unresolvable
     (AmbiguousPayoutError at sync time) -- stored for reorg tracking only; no
-    pending pack is ever created for it, so it never becomes a card candidate."""
+    pending pack is ever created for it, so it never becomes a card candidate.
+
+    A block that was reorged out (is_active=0) and then comes back onto the
+    best chain arrives here again with the same block_hash: reactivate the
+    existing row instead of failing on the primary key. first_seen_at keeps
+    its original value."""
     conn.execute(
         """INSERT INTO blocks (block_hash, height, payout_script, is_active, first_seen_at)
-           VALUES (?, ?, ?, 1, ?)""",
+           VALUES (?, ?, ?, 1, ?)
+           ON CONFLICT(block_hash) DO UPDATE SET
+               height = excluded.height,
+               payout_script = excluded.payout_script,
+               is_active = 1,
+               deactivated_at = NULL""",
         (block_hash, height, payout_script, now_iso()),
     )
 
@@ -205,9 +250,23 @@ def insert_pending_pack(
     matures_at: int,
     required_heights: list,
 ) -> None:
+    """A retracted pack whose block comes back onto the best chain is reset to
+    pending so it reveals again (deterministically, so the same card). Any
+    other existing row is left alone."""
     conn.execute(
         """INSERT INTO packs (block_hash, mint_height, matures_at, required_heights, status)
-           VALUES (?, ?, ?, ?, 'pending')""",
+           VALUES (?, ?, ?, ?, 'pending')
+           ON CONFLICT(block_hash) DO UPDATE SET
+               mint_height = excluded.mint_height,
+               matures_at = excluded.matures_at,
+               required_heights = excluded.required_heights,
+               status = 'pending',
+               tier = NULL,
+               card_id = NULL,
+               seed_hex = NULL,
+               revealed_at = NULL,
+               retracted_at = NULL
+           WHERE packs.status = 'retracted'""",
         (block_hash, mint_height, matures_at, json.dumps(required_heights)),
     )
 
@@ -246,6 +305,43 @@ def retract_pack(conn: sqlite3.Connection, block_hash: str) -> None:
         "UPDATE packs SET status = 'retracted', retracted_at = ? WHERE block_hash = ?",
         (now_iso(), block_hash),
     )
+
+
+def reset_reveals_spanning_fork(conn: sqlite3.Connection, fork_height: int) -> list:
+    """A pack's reveal hashes the block `maturity` blocks after it. A reorg
+    from fork_height replaces those later blocks, so any already-revealed pack
+    minted below the fork but maturing at or above it was revealed against a
+    block that's no longer on the chain. Put it back to pending so it reveals
+    again from the new chain. (Packs minted at or above the fork are retracted
+    separately by the reorg handler.) Returns the affected block hashes."""
+    rows = conn.execute(
+        """SELECT block_hash FROM packs
+           WHERE status = 'revealed' AND mint_height < ? AND matures_at >= ?""",
+        (fork_height, fork_height),
+    ).fetchall()
+    hashes = [r["block_hash"] for r in rows]
+    conn.executemany(
+        """UPDATE packs SET status = 'pending', tier = NULL, card_id = NULL,
+               seed_hex = NULL, revealed_at = NULL
+           WHERE block_hash = ?""",
+        [(h,) for h in hashes],
+    )
+    return hashes
+
+
+def revealed_packs_in_past_reorg_windows(conn: sqlite3.Connection) -> list:
+    """For the one-time v1.0.1 recheck: revealed packs on active blocks that
+    were minted below a logged reorg's fork height but matured at or above it,
+    i.e. the ones v1.0.0 could have revealed against an orphaned block."""
+    rows = conn.execute(
+        """SELECT DISTINCT p.block_hash, p.mint_height
+           FROM packs p
+           JOIN blocks b ON b.block_hash = p.block_hash
+           JOIN reorg_log r ON p.mint_height < r.fork_height AND p.matures_at >= r.fork_height
+           WHERE p.status = 'revealed' AND b.is_active = 1
+           ORDER BY p.mint_height"""
+    ).fetchall()
+    return [(r["block_hash"], r["mint_height"]) for r in rows]
 
 
 # --- reorg_log ------------------------------------------------------------

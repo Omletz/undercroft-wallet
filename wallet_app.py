@@ -68,6 +68,7 @@ from reveal import SaltedFutureBlockReveal
 from wallet_rpc import DEFAULT_WALLET_NAME, WalletRPCClient
 
 APP_NAME = "Undercroft Wallet"
+VERSION = "1.0.1"
 ASSETS_DIR = Path(__file__).parent / "assets"
 BIN_DIR = Path(__file__).parent / "bin"
 ART_DIR = Path(__file__).parent / "art"
@@ -441,7 +442,7 @@ class OverviewTab(QWidget):
             if not banner_pixmap.isNull():
                 # Cap the width so it never dominates the tab on a small window --
                 # scaled proportionally, so it still looks right at any DPI.
-                scaled = banner_pixmap.scaledToWidth(360, Qt.TransformationMode.SmoothTransformation)
+                scaled = banner_pixmap.scaledToWidth(440, Qt.TransformationMode.SmoothTransformation)
                 banner_label.setPixmap(scaled)
 
         status_form = QFormLayout()
@@ -861,8 +862,9 @@ class BinderTab(QWidget):
     deliberately never calls db.open_db()/init_db() directly (that path
     reseeds the card catalog and commits on every call) -- it only ever
     needs SELECTs, so it opens the file in SQLite's own read-only URI mode
-    instead, which can't block or be blocked by the indexer pass's writes
-    (those always finish and close before this tab's own read runs)."""
+    instead. The index file is in WAL mode (see db.connect), so this read
+    never blocks, or is blocked by, an indexer pass that's mid-write -- it
+    just sees the last committed state."""
 
     TIER_LABEL = {"uncommon": "Uncommon", "holo_rare": "Holo Rare", "secret_rare": "Secret Rare"}
 
@@ -1157,11 +1159,19 @@ class BinderTab(QWidget):
 
         self._clear_grid()
 
-        shown = 0
-        for card_id, info in sorted(grouped.items()):
+        # Rarest first: secret rares, then holo rares, then uncommons, each
+        # tier in card-number order.
+        tier_rank = {"secret_rare": 0, "holo_rare": 1, "uncommon": 2}
+        entries = []
+        for card_id, info in grouped.items():
             card_obj = render_card.get_card_by_id(card_id)
             if card_obj is None:
                 continue  # revealed card_id not in the local catalog -- skip rather than crash
+            entries.append((tier_rank.get(card_obj.tier, len(tier_rank)), card_id, card_obj, info))
+        entries.sort(key=lambda e: (e[0], e[1]))
+
+        shown = 0
+        for _rank, _card_id, card_obj, info in entries:
             tile = self._build_tile(card_obj, info["count"], info["heights"])
             r, c = divmod(shown, BINDER_COLUMNS)
             self.grid_layout.addWidget(tile, r, c)
@@ -1195,6 +1205,8 @@ class MainWindow(QMainWindow):
         self.manager = manager
         self.wallet = wallet
         self._active_workers: list[Worker] = []
+        self._refresh_running = False
+        self._refresh_again = False
         self._known_addresses: list[str] = []
         # A plain (non-wallet-scoped) RPC client for the embedded card
         # indexer -- separate from self.wallet's WalletRPCClient since the
@@ -1205,7 +1217,7 @@ class MainWindow(QMainWindow):
         self._indexer_node = BitcoinRPCClient(self.manager.config.to_node_config())
         self._indexer_scheme = SaltedFutureBlockReveal(maturity=30)
 
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} v{VERSION}")
         icon_path = ASSETS_DIR / "icon.png"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -1228,6 +1240,8 @@ class MainWindow(QMainWindow):
         self._tabs = tabs
 
         self.statusBar().showMessage(f"Connected -- {settings.network}")
+        # Permanent widget: stays put while temporary status messages come and go.
+        self.statusBar().addPermanentWidget(QLabel(f"v{VERSION}"))
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh_now)
@@ -1262,10 +1276,25 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def refresh_now(self) -> None:
+        """Only one refresh (and so one card-indexer pass) runs at a time. Two
+        overlapping passes writing the same SQLite file is what produced
+        "database is locked". A refresh asked for while one is running isn't
+        dropped: it runs once more as soon as the current one finishes."""
+        if self._refresh_running:
+            self._refresh_again = True
+            return
+        self._refresh_running = True
+        self._refresh_again = False
         worker = Worker(self._gather_refresh_data)
         worker.succeeded.connect(self._apply_refresh)
         worker.failed.connect(lambda msg: self.statusBar().showMessage(f"Refresh failed: {msg}", 5000))
+        worker.finished.connect(self._on_refresh_finished)
         self.run_worker(worker)
+
+    def _on_refresh_finished(self) -> None:
+        self._refresh_running = False
+        if self._refresh_again:
+            self.refresh_now()
 
     def _gather_refresh_data(self) -> dict:
         info = self.wallet.get_blockchain_info()

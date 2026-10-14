@@ -35,6 +35,15 @@ log = logging.getLogger("sync_daemon")
 
 REORG_MAX_DEPTH = 200  # generous multiple of the 30-block maturity window
 
+# Commit progress every N heights during forward sync, so a long catch-up
+# never holds one write transaction for the whole pass.
+COMMIT_EVERY = 250
+
+# Most heights one pass will index. A fresh wallet on a long chain catches up
+# over several refresh ticks instead of one very long pass (the wallet's
+# balances/history only redraw once the pass returns).
+MAX_BLOCKS_PER_PASS = 500
+
 
 class DeepReorgError(RuntimeError):
     """Reorg fork point not found within REORG_MAX_DEPTH -- needs a human look."""
@@ -76,10 +85,14 @@ def handle_reorg(conn, node: NodeClient, fork_height: int, old_tip: int, new_tip
         if pack_row is not None:
             db.retract_pack(conn, block_hash)
             retracted.append(block_hash)
+    # Packs minted just below the fork reveal against blocks the reorg just
+    # replaced -- send any already-revealed ones back to pending.
+    reset = db.reset_reveals_spanning_fork(conn, fork_height)
     db.log_reorg(conn, fork_height, old_tip, new_tip, deactivated, retracted)
     log.warning(
-        "reorg handled: fork_height=%d old_tip=%d new_tip=%d deactivated=%d retracted=%d",
-        fork_height, old_tip, new_tip, len(deactivated), len(retracted),
+        "reorg handled: fork_height=%d old_tip=%d new_tip=%d deactivated=%d retracted=%d "
+        "reveals_reset=%d",
+        fork_height, old_tip, new_tip, len(deactivated), len(retracted), len(reset),
     )
 
 
@@ -100,40 +113,72 @@ def sync_forward(conn, node: NodeClient, scheme: SaltedFutureBlockReveal, from_h
                 height, exc_info=True,
             )
             db.insert_block(conn, block_hash, height, None)
-            db.set_last_synced_height(conn, height)
-            continue
-        db.insert_block(conn, block_hash, height, payout_script)
-        db.insert_pending_pack(
-            conn,
-            block_hash=block_hash,
-            mint_height=height,
-            matures_at=scheme.matures_at(height),
-            required_heights=scheme.required_heights(height),
-        )
+        else:
+            db.insert_block(conn, block_hash, height, payout_script)
+            db.insert_pending_pack(
+                conn,
+                block_hash=block_hash,
+                mint_height=height,
+                matures_at=scheme.matures_at(height),
+                required_heights=scheme.required_heights(height),
+            )
         db.set_last_synced_height(conn, height)
+        if (height - from_height + 1) % COMMIT_EVERY == 0:
+            conn.commit()
+
+
+def _reveal_one(conn, node: NodeClient, scheme: SaltedFutureBlockReveal, block_hash: str, mint_height: int) -> Optional[str]:
+    seed = scheme.compute_seed(node, mint_height)
+    tier = classify_seed(seed)
+    card_id: Optional[str] = None
+    if tier is not None:
+        # Which SET is active at this mint height -- always Set 1 today,
+        # but once a future set's activation height is reached (per the
+        # card-set manifest, see set_manifest.py/set_registry.py) this
+        # picks that set's pool instead, automatically and identically
+        # across every wallet re-deriving the same block's reveal.
+        era = set_registry.active_era_for_height(mint_height)
+        idx = pick_card_index(seed, era.pool_size(tier))
+        card_id = era.list_cards(tier)[idx].card_id
+    db.reveal_pack(conn, block_hash, tier, card_id, seed.hex())
+    return card_id
 
 
 def reveal_ready_packs(conn, node: NodeClient, scheme: SaltedFutureBlockReveal, tip: int) -> int:
+    """tip must be a height this DB has actually synced to: a reveal reads the
+    block `maturity` above its mint, and only synced heights are covered by
+    reorg detection."""
     ready = db.get_pending_ready_packs(conn, tip)
     for block_hash, mint_height in ready:
-        seed = scheme.compute_seed(node, mint_height)
-        tier = classify_seed(seed)
-        card_id: Optional[str] = None
-        if tier is not None:
-            # Which SET is active at this mint height -- always Set 1 today,
-            # but once a future set's activation height is reached (per the
-            # card-set manifest, see set_manifest.py/set_registry.py) this
-            # picks that set's pool instead, automatically and identically
-            # across every wallet re-deriving the same block's reveal.
-            era = set_registry.active_era_for_height(mint_height)
-            idx = pick_card_index(seed, era.pool_size(tier))
-            card_id = era.list_cards(tier)[idx].card_id
-        db.reveal_pack(conn, block_hash, tier, card_id, seed.hex())
+        card_id = _reveal_one(conn, node, scheme, block_hash, mint_height)
         log.info(
             "height %d revealed: %s",
             mint_height, card_id if card_id else "no drop (coins only)",
         )
     return len(ready)
+
+
+def recheck_reorg_window_reveals(conn, node: NodeClient, scheme: SaltedFutureBlockReveal) -> int:
+    """One-time fix for databases written by v1.0.0, which didn't reset reveals
+    that spanned a reorg's fork. Re-derives only those packs, in place, from
+    the current chain: correct cards are rewritten unchanged, wrong ones are
+    corrected. Returns how many packs changed."""
+    changed = 0
+    for block_hash, mint_height in db.revealed_packs_in_past_reorg_windows(conn):
+        before = conn.execute(
+            "SELECT card_id, seed_hex FROM packs WHERE block_hash = ?", (block_hash,)
+        ).fetchone()
+        card_id = _reveal_one(conn, node, scheme, block_hash, mint_height)
+        after_seed = conn.execute(
+            "SELECT seed_hex FROM packs WHERE block_hash = ?", (block_hash,)
+        ).fetchone()["seed_hex"]
+        if before["seed_hex"] != after_seed:
+            changed += 1
+            log.warning(
+                "height %d reveal corrected: %s -> %s",
+                mint_height, before["card_id"] or "no drop", card_id or "no drop",
+            )
+    return changed
 
 
 def run_once(conn, node: NodeClient, scheme: SaltedFutureBlockReveal) -> dict:
@@ -168,16 +213,25 @@ def run_once(conn, node: NodeClient, scheme: SaltedFutureBlockReveal) -> dict:
             last_synced = fork_height - 1
             reorg_handled = True
 
+    synced_to = last_synced
     if tip > last_synced:
-        sync_forward(conn, node, scheme, last_synced + 1, tip)
+        synced_to = min(tip, last_synced + MAX_BLOCKS_PER_PASS)
+        sync_forward(conn, node, scheme, last_synced + 1, synced_to)
 
-    revealed_count = reveal_ready_packs(conn, node, scheme, tip)
+    revealed_count = reveal_ready_packs(conn, node, scheme, synced_to)
+
+    corrected = 0
+    if db.get_schema_version(conn) < db.SCHEMA_VERSION:
+        corrected = recheck_reorg_window_reveals(conn, node, scheme)
+        db.set_schema_version(conn, db.SCHEMA_VERSION)
 
     return {
         "tip": tip,
-        "synced_to": max(last_synced, tip),
+        "synced_to": synced_to,
+        "caught_up": synced_to >= tip,
         "reorg_handled": reorg_handled,
         "newly_revealed": revealed_count,
+        "reveals_corrected": corrected,
     }
 
 
@@ -196,7 +250,7 @@ def run_forever(
         try:
             with db.open_db(db_path) as conn:
                 summary = run_once(conn, node, scheme)
-            if summary["reorg_handled"] or summary["newly_revealed"]:
+            if summary["reorg_handled"] or summary["newly_revealed"] or summary["reveals_corrected"]:
                 log.info("sync pass: %s", summary)
         except DeepReorgError:
             log.exception("deep reorg beyond configured bound -- daemon stopping, needs manual review")
